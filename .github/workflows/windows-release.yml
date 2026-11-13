@@ -93,6 +93,13 @@ jobs:
           if ($metadata -notmatch ('(?m)^version:\s*["'']?' + [regex]::Escape($env:PV_VERSION) + '["'']?\s*$')) {
             throw 'The update metadata version does not match the installer build.'
           }
+          $pathMatch = [regex]::Match($metadata, '(?m)^path:\s*["'']?([^"''\r\n]+)["'']?\s*$')
+          $hashMatch = [regex]::Match($metadata, '(?m)^sha512:\s*([A-Za-z0-9+/=]+)\s*$')
+          if (-not $pathMatch.Success -or -not $hashMatch.Success -or $pathMatch.Groups[1].Value.Trim() -ne $installer[0].Name) {
+            throw 'Update metadata does not reference the generated installer.'
+          }
+          $actualHash = [Convert]::ToBase64String([Convert]::FromHexString((Get-FileHash -LiteralPath $installer[0].FullName -Algorithm SHA512).Hash))
+          if ($actualHash -cne $hashMatch.Groups[1].Value) { throw 'Update metadata checksum does not match the installer.' }
       - uses: actions/upload-artifact@v4
         with:
           name: project-voice-windows-${{ steps.signal.outputs.version }}
