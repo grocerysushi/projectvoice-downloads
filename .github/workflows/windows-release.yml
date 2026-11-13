@@ -1,0 +1,140 @@
+# Install as .github/workflows/windows-release.yml in the separate public
+# grocerysushi/projectvoice-downloads repository, not the private source repo.
+name: Build and publish Project Voice for Windows
+
+on:
+  push:
+    branches: [main]
+    paths: [release-source.json]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: project-voice-windows-release
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      NEXT_PUBLIC_INSFORGE_URL: ${{ vars.NEXT_PUBLIC_INSFORGE_URL }}
+      NEXT_PUBLIC_INSFORGE_ANON_KEY: ${{ vars.NEXT_PUBLIC_INSFORGE_ANON_KEY }}
+      PV_UPDATE_OWNER: grocerysushi
+      PV_UPDATE_REPO: projectvoice-downloads
+    steps:
+      - name: Checkout release signal
+        uses: actions/checkout@v4
+        with:
+          path: downloads
+          persist-credentials: false
+      - name: Validate signal and public app configuration
+        id: signal
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath 'downloads/release-source.json')) {
+            throw 'No release signal exists yet. Push to master in the private source repository to create the first one.'
+          }
+          $signal = Get-Content -Raw -LiteralPath 'downloads/release-source.json' | ConvertFrom-Json
+          if ($signal.sourceSha -cnotmatch '^[0-9a-f]{40}$' -or $signal.version -cnotmatch '^0\.1\.[1-9][0-9]*$') {
+            throw 'The release signal has an invalid source revision or version.'
+          }
+          if (-not $env:NEXT_PUBLIC_INSFORGE_URL -or -not $env:NEXT_PUBLIC_INSFORGE_ANON_KEY) {
+            throw 'Set the NEXT_PUBLIC_INSFORGE_URL and NEXT_PUBLIC_INSFORGE_ANON_KEY repository variables.'
+          }
+          "sha=$($signal.sourceSha)" >> $env:GITHUB_OUTPUT
+          "version=$($signal.version)" >> $env:GITHUB_OUTPUT
+      - name: Checkout the exact private source revision
+        uses: actions/checkout@v4
+        with:
+          repository: grocerysushi/projectvoice
+          ref: ${{ steps.signal.outputs.sha }}
+          ssh-key: ${{ secrets.PV_SOURCE_READ_KEY }}
+          path: source
+          # Keep the temporary SSH identity to recheck master before release.
+          persist-credentials: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+      - name: Install dependencies
+        working-directory: source
+        run: npm ci
+      - name: Typecheck
+        working-directory: source
+        run: npm run typecheck
+      - name: Test
+        working-directory: source
+        run: npm test
+      - name: Set installer and updater version
+        working-directory: source
+        env:
+          PV_VERSION: ${{ steps.signal.outputs.version }}
+        run: npm version $env:PV_VERSION --no-git-tag-version --allow-same-version
+      - name: Build Windows installer
+        working-directory: source
+        run: npm run desktop:build
+      - name: Validate installer and metadata
+        shell: pwsh
+        env:
+          PV_VERSION: ${{ steps.signal.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = @(Get-ChildItem -LiteralPath source/dist -Filter '*.exe' -File)
+          if ($installer.Count -ne 1 -or -not (Test-Path -LiteralPath 'source/dist/latest.yml')) {
+            throw 'Expected exactly one installer and latest.yml in source/dist.'
+          }
+          $metadata = Get-Content -Raw -LiteralPath 'source/dist/latest.yml'
+          if ($metadata -notmatch ('(?m)^version:\s*["'']?' + [regex]::Escape($env:PV_VERSION) + '["'']?\s*$')) {
+            throw 'The update metadata version does not match the installer build.'
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: project-voice-windows-${{ steps.signal.outputs.version }}
+          path: |
+            source/dist/*.exe
+            source/dist/*.blockmap
+            source/dist/latest.yml
+          if-no-files-found: error
+      - name: Verify source is still the tip of master
+        working-directory: source
+        shell: pwsh
+        env:
+          PV_SOURCE_SHA: ${{ steps.signal.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $head = git ls-remote origin refs/heads/master
+          if ($LASTEXITCODE -ne 0 -or -not $head) { throw 'Could not check the private source branch.' }
+          if (($head -split '\s+')[0] -ne $env:PV_SOURCE_SHA) {
+            throw 'A newer source commit exists. Its release signal will publish the next version.'
+          }
+      - name: Publish a complete release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PV_VERSION: ${{ steps.signal.outputs.version }}
+          PV_SOURCE_SHA: ${{ steps.signal.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "v$env:PV_VERSION"
+          $assets = @(Get-ChildItem -LiteralPath source/dist -File | Where-Object { $_.Name -eq 'latest.yml' -or $_.Extension -in '.exe', '.blockmap' } | ForEach-Object { $_.FullName })
+          # Keep incomplete uploads invisible to the updater. Retrying a failed
+          # draft is safe; never replace an already published version.
+          $existingJson = gh release view $tag --repo $env:GITHUB_REPOSITORY --json isDraft,body 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            $existing = $existingJson | ConvertFrom-Json
+            if ($existing.body -ne "Built from source commit $env:PV_SOURCE_SHA.") { throw 'This version already belongs to a different source revision.' }
+            if (-not $existing.isDraft) { Write-Output 'This exact release is already published.'; exit 0 }
+          } else {
+            gh release create $tag --repo $env:GITHUB_REPOSITORY --title "Project Voice $env:PV_VERSION" --notes "Built from source commit $env:PV_SOURCE_SHA." --draft
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft release.' }
+          }
+          gh release upload $tag @assets --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Could not upload release assets; the release remains a draft.' }
+          gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Could not publish the completed release.' }
