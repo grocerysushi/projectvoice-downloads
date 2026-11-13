@@ -40,7 +40,7 @@ jobs:
             throw 'No release signal exists yet. Push to master in the private source repository to create the first one.'
           }
           $signal = Get-Content -Raw -LiteralPath 'downloads/release-source.json' | ConvertFrom-Json
-          if ($signal.sourceSha -cnotmatch '^[0-9a-f]{40}$' -or $signal.version -cnotmatch '^0\.1\.[1-9][0-9]*$') {
+          if ($signal.sourceSha -cnotmatch '^[0-9a-f]{40}$' -or $signal.version -cnotmatch '^0\.1\.[1-9][0-9]{0,8}$') {
             throw 'The release signal has an invalid source revision or version.'
           }
           if (-not $env:NEXT_PUBLIC_INSFORGE_URL -or -not $env:NEXT_PUBLIC_INSFORGE_ANON_KEY) {
@@ -53,6 +53,7 @@ jobs:
         with:
           repository: grocerysushi/projectvoice
           ref: ${{ steps.signal.outputs.sha }}
+          fetch-depth: 2
           ssh-key: ${{ secrets.PV_SOURCE_READ_KEY }}
           path: source
           # Keep the temporary SSH identity to recheck master before release.
@@ -130,15 +131,27 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $tag = "v$env:PV_VERSION"
           $assets = @(Get-ChildItem -LiteralPath source/dist -File | Where-Object { $_.Name -eq 'latest.yml' -or $_.Extension -in '.exe', '.blockmap' } | ForEach-Object { $_.FullName })
+          # Only deliberately curated release notes from this exact source commit are public.
+          $releaseBody = "Built from source commit $env:PV_SOURCE_SHA."
+          if (Test-Path -LiteralPath 'source/scripts/release/release-changelog.mjs') {
+            Push-Location source
+            try {
+              $releaseBody = (node scripts/release/release-changelog.mjs body | Out-String).TrimEnd()
+              if ($LASTEXITCODE -ne 0 -or -not $releaseBody) { throw 'Could not generate the public release notes.' }
+            } finally { Pop-Location }
+          }
+          $releaseBody = $releaseBody.Replace("`r`n", "`n")
+          $notesFile = Join-Path $env:RUNNER_TEMP 'project-voice-release-notes.txt'
+          [System.IO.File]::WriteAllText($notesFile, $releaseBody, [System.Text.UTF8Encoding]::new($false))
           # Keep incomplete uploads invisible to the updater. Retrying a failed
           # draft is safe; never replace an already published version.
           $existingJson = gh release view $tag --repo $env:GITHUB_REPOSITORY --json isDraft,body 2>$null
           if ($LASTEXITCODE -eq 0) {
             $existing = $existingJson | ConvertFrom-Json
-            if ($existing.body -ne "Built from source commit $env:PV_SOURCE_SHA.") { throw 'This version already belongs to a different source revision.' }
+            if ($existing.body.Replace("`r`n", "`n").TrimEnd() -cne $releaseBody) { throw 'This version already belongs to a different source revision.' }
             if (-not $existing.isDraft) { Write-Output 'This exact release is already published.'; exit 0 }
           } else {
-            gh release create $tag --repo $env:GITHUB_REPOSITORY --title "Project Voice $env:PV_VERSION" --notes "Built from source commit $env:PV_SOURCE_SHA." --draft
+            gh release create $tag --repo $env:GITHUB_REPOSITORY --title "Project Voice $env:PV_VERSION" --notes-file $notesFile --draft
             if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft release.' }
           }
           gh release upload $tag @assets --repo $env:GITHUB_REPOSITORY --clobber
