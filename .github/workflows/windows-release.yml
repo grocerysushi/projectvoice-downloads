@@ -1,6 +1,6 @@
 # Install as .github/workflows/windows-release.yml in the separate public
 # grocerysushi/projectvoice-downloads repository, not the private source repo.
-name: Build and publish Project Voice for Windows
+name: Build and publish Backcourts for Windows
 
 on:
   push:
@@ -103,7 +103,7 @@ jobs:
           if ($actualHash -cne $hashMatch.Groups[1].Value) { throw 'Update metadata checksum does not match the installer.' }
       - uses: actions/upload-artifact@v4
         with:
-          name: project-voice-windows-${{ steps.signal.outputs.version }}
+          name: backcourts-windows-${{ steps.signal.outputs.version }}
           path: |
             source/dist/*.exe
             source/dist/*.blockmap
@@ -151,7 +151,7 @@ jobs:
             if ($existing.body.Replace("`r`n", "`n").TrimEnd() -cne $releaseBody) { throw 'This version already belongs to a different source revision.' }
             if (-not $existing.isDraft) { Write-Output 'This exact release is already published.'; exit 0 }
           } else {
-            gh release create $tag --repo $env:GITHUB_REPOSITORY --title "Project Voice $env:PV_VERSION" --notes-file $notesFile --draft
+            gh release create $tag --repo $env:GITHUB_REPOSITORY --title "Backcourts $env:PV_VERSION" --notes-file $notesFile --draft
             if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft release.' }
           }
           gh release upload $tag @assets --repo $env:GITHUB_REPOSITORY --clobber
